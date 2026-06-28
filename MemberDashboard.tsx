@@ -1,4 +1,5 @@
-import { useState, useRef } from 'react';
+import { useState, useEffect } from 'react';
+import { supabase, formatSupabaseError } from './supabase';
 import {
     Home, CreditCard, ArrowRightLeft, Bell, LogOut, Filter, Menu, X
 } from 'lucide-react';
@@ -9,93 +10,158 @@ interface MemberDashboardProps {
 }
 
 interface Transaction {
-    id: number;
+    id: string;
     type: 'Deposit' | 'Withdrawal' | 'Loan';
     amount: number;
-    date: string;
+    transaction_date: string;
     note: string;
 }
 
 interface LoanRequest {
-    id: number;
+    id: string;
     amount: number;
     purpose: string;
     status: 'Pending' | 'Approved' | 'Rejected';
-    date: string;
-    repaymentDate: string;
+    applied_on: string;
+    repayment_date: string;
 }
 
 interface Reminder {
-    id: number;
+    id: string;
     title: string;
     message: string;
-    date: string;
+    created_at: string;
 }
 
 export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
     const [sidebarOpen, setSidebarOpen] = useState(true);
     const [activeTab, setActiveTab] = useState('home');
     const [showReminders, setShowReminders] = useState(false);
-    const orgName = "Your SACCO";
+
+    // Auth & Org context
+    const [userId, setUserId] = useState<string | null>(null);
+    const [saccoId, setSaccoId] = useState<string | null>(null);
+    const [orgName, setOrgName] = useState("Loading Sacco...");
+    const [userProfile, setUserProfile] = useState<any>(null);
 
     // Data state
-    const [transactions] = useState<Transaction[]>([]);
+    const [transactions, setTransactions] = useState<Transaction[]>([]);
     const [loans, setLoans] = useState<LoanRequest[]>([]);
-    const [reminders] = useState<Reminder[]>([]);
+    const [reminders, setReminders] = useState<Reminder[]>([]);
+    const [savingsBalance, setSavingsBalance] = useState(0);
+    const [outstandingLoan, setOutstandingLoan] = useState(0);
 
     // Form state
-    const [loanForm, setLoanForm] = useState({
-        name: '',
-        amount: '',
-        purpose: '',
-        repaymentDate: ''
-    });
+    const [loanForm, setLoanForm] = useState({ amount: '', purpose: '', repaymentDate: '' });
     const [loanSuccess, setLoanSuccess] = useState(false);
+    const [loanLoading, setLoanLoading] = useState(false);
+    const [editPhoneMode, setEditPhoneMode] = useState(false);
+    const [phoneValue, setPhoneValue] = useState('');
+    const [phoneSaving, setPhoneSaving] = useState(false);
 
     // Filter state
     const [txnDateFrom, setTxnDateFrom] = useState('');
     const [txnDateTo, setTxnDateTo] = useState('');
 
-    const nextId = useRef(1);
+    useEffect(() => {
+        loadMemberData();
+    }, []);
 
-    const handleLoanSubmit = (e: React.FormEvent) => {
+    const loadMemberData = async () => {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) return;
+        setUserId(user.id);
+
+        // Fetch Profile
+        const { data: profile } = await supabase.from('profiles').select('*').eq('id', user.id).single();
+        if (profile) {
+            setUserProfile(profile);
+            setSaccoId(profile.sacco_id);
+
+            // Fetch Sacco Name
+            const { data: saccoData } = await supabase.from('saccos').select('name').eq('id', profile.sacco_id).single();
+            if (saccoData) setOrgName(saccoData.name);
+
+            // Fetch Dashboard Stats (SQL View)
+            const { data: stats } = await supabase.from('member_dashboard_stats').select('*').eq('member_id', user.id).single();
+            if (stats) {
+                setSavingsBalance(stats.savings_balance || 0);
+                setOutstandingLoan(stats.outstanding_loan_amount || 0);
+            }
+
+            // Fetch Transactions
+            const { data: txns } = await supabase.from('transactions')
+                .select('*')
+                .eq('member_id', user.id)
+                .order('transaction_date', { ascending: false });
+            if (txns) setTransactions(txns as any);
+
+            // Fetch Loans
+            const { data: loanData } = await supabase.from('loans')
+                .select('*')
+                .eq('member_id', user.id)
+                .order('applied_on', { ascending: false });
+            if (loanData) setLoans(loanData as any);
+
+            // Fetch Reminders (broadcast + member-specific)
+            const { data: remData } = await supabase.from('reminders')
+                .select('*')
+                .eq('sacco_id', profile.sacco_id)
+                .or(`member_id.is.null,member_id.eq.${user.id}`)
+                .order('created_at', { ascending: false });
+            if (remData) setReminders(remData as any);
+        }
+    };
+
+    const handleLoanSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!loanForm.amount || !loanForm.purpose || !loanForm.repaymentDate) return;
+        if (!loanForm.amount || !loanForm.purpose || !loanForm.repaymentDate || !saccoId) return;
 
-        const newLoan: LoanRequest = {
-            id: nextId.current++,
+        const maxLoan = savingsBalance * 0.6;
+        if (Number(loanForm.amount) > maxLoan) {
+            alert(`You can only request up to 60% of your total savings (Max: UGX ${maxLoan.toLocaleString()}).`);
+            return;
+        }
+
+        setLoanLoading(true);
+        const { error } = await supabase.from('loans').insert([{
+            sacco_id: saccoId,
+            member_id: userId,
             amount: Number(loanForm.amount),
             purpose: loanForm.purpose,
-            status: 'Pending',
-            date: new Date().toISOString().split('T')[0],
-            repaymentDate: loanForm.repaymentDate
-        };
+            repayment_date: loanForm.repaymentDate,
+            status: 'Pending'
+        }]);
 
-        setLoans(prev => [newLoan, ...prev]);
+        setLoanLoading(false);
+
+        if (error) {
+            alert("Error requesting loan: " + formatSupabaseError(error));
+            return;
+        }
+
         setLoanSuccess(true);
+        loadMemberData(); // Refresh Data
+
         setTimeout(() => {
             setLoanSuccess(false);
             setActiveTab('home');
-            setLoanForm({ ...loanForm, amount: '', purpose: '', repaymentDate: '' });
+            setLoanForm({ amount: '', purpose: '', repaymentDate: '' });
         }, 2000);
     };
 
-    const filteredTxns = transactions.filter(t => {
-        if (txnDateFrom && t.date < txnDateFrom) return false;
-        if (txnDateTo && t.date > txnDateTo) return false;
-        return true;
-    });
+    const handleLogoutClick = async () => {
+        await supabase.auth.signOut();
+        onLogout();
+    };
 
-    const totalSavings = transactions
-        .filter(t => t.type === 'Deposit')
-        .reduce((sum, t) => sum + t.amount, 0) -
-        transactions
-            .filter(t => t.type === 'Withdrawal')
-            .reduce((sum, t) => sum + t.amount, 0);
-
-    const outstandingLoan = loans
-        .filter(l => l.status === 'Approved')
-        .reduce((sum, l) => sum + l.amount, 0);
+    const filteredTxns = transactions
+        .filter(t => {
+            if (txnDateFrom && t.transaction_date < txnDateFrom) return false;
+            if (txnDateTo && t.transaction_date > txnDateTo) return false;
+            return true;
+        })
+        .sort((a, b) => new Date(b.transaction_date).getTime() - new Date(a.transaction_date).getTime());
 
     const renderContent = () => {
         switch (activeTab) {
@@ -105,7 +171,7 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                         <div className="dash-metrics-grid">
                             <div className="metric-card">
                                 <div className="metric-label">Savings Balance</div>
-                                <div className="metric-value">UGX {totalSavings.toLocaleString()}</div>
+                                <div className="metric-value">UGX {savingsBalance.toLocaleString()}</div>
                             </div>
                             <div className="metric-card">
                                 <div className="metric-label">Outstanding Loan</div>
@@ -114,14 +180,85 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                                     <div style={{ marginTop: '12px', fontSize: '0.85rem', color: '#e53e3e', fontWeight: 600 }}>
                                         Next Deadline: {loans
                                             .filter(l => l.status === 'Approved')
-                                            .sort((a, b) => a.repaymentDate.localeCompare(b.repaymentDate))[0].repaymentDate}
+                                            .sort((a, b) => a.repayment_date.localeCompare(b.repayment_date))[0].repayment_date}
                                     </div>
                                 )}
                             </div>
                         </div>
 
                         <div className="dash-section-header" style={{ marginTop: '24px' }}>
-                            <h2>Need financing?</h2>
+                            <h2>Account Information</h2>
+                        </div>
+                        <div className="metric-card" style={{ maxWidth: '600px' }}>
+                            <div style={{ marginBottom: '16px' }}>
+                                <label className="label-field">Name</label>
+                                <div style={{ padding: '12px', background: '#f7f9fc', borderRadius: '8px', color: '#1a1f36' }}>{userProfile?.full_name || 'Loading...'}</div>
+                            </div>
+                            <div style={{ marginBottom: '16px' }}>
+                                <label className="label-field">Phone Number</label>
+                                {editPhoneMode ? (
+                                    <div style={{ display: 'flex', gap: '8px' }}>
+                                        <input 
+                                            type="tel" 
+                                            className="input-field" 
+                                            value={phoneValue} 
+                                            onChange={(e) => setPhoneValue(e.target.value)}
+                                            placeholder="Enter phone number"
+                                            style={{ flex: 1 }}
+                                            autoFocus
+                                        />
+                                        <button
+                                            className="btn primary"
+                                            onClick={async () => {
+                                                // delegate to helper to ensure auth + proper UX
+                                                if (phoneSaving) return;
+                                                setPhoneSaving(true);
+                                                try {
+                                                    // ensure we have the latest user id
+                                                    const { data: userData } = await supabase.auth.getUser();
+                                                    const authId = userData?.user?.id || userId;
+                                                    if (!authId) throw new Error('Unable to determine user id');
+
+                                                    const { error } = await supabase.from('profiles').update({ phone: phoneValue }).eq('id', authId);
+                                                    if (error) throw error;
+
+                                                    // Refresh local profile
+                                                    const { data: refreshed } = await supabase.from('profiles').select('*').eq('id', authId).single();
+                                                    if (refreshed) setUserProfile(refreshed as any);
+                                                    setEditPhoneMode(false);
+                                                    setPhoneValue('');
+                                                } catch (err: any) {
+                                                    alert('Failed to update phone: ' + formatSupabaseError(err));
+                                                } finally {
+                                                    setPhoneSaving(false);
+                                                }
+                                            }}
+                                            style={{ whiteSpace: 'nowrap', minWidth: '80px' }}
+                                            disabled={phoneSaving}
+                                        >
+                                            {phoneSaving ? 'Saving...' : 'Save'}
+                                        </button>
+                                        <button 
+                                            className="btn ghost" 
+                                            onClick={() => { setEditPhoneMode(false); setPhoneValue(''); }}
+                                            style={{ whiteSpace: 'nowrap', minWidth: '80px' }}
+                                        >
+                                            Cancel
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px', background: '#f7f9fc', borderRadius: '8px', color: '#1a1f36' }}>
+                                        <span>{userProfile?.phone || 'Not provided'}</span>
+                                        <button 
+                                            className="btn ghost" 
+                                            onClick={() => { setEditPhoneMode(true); setPhoneValue(userProfile?.phone || ''); }}
+                                            style={{ fontSize: '0.85rem' }}
+                                        >
+                                            Edit
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
                         </div>
                         <button className="btn-dark" onClick={() => setActiveTab('loans')}>Request a Loan</button>
 
@@ -136,11 +273,11 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                                 <table className="dash-table">
                                     <thead><tr><th>Type</th><th>Amount (UGX)</th><th>Date</th><th>Note</th></tr></thead>
                                     <tbody>
-                                        {transactions.slice(0, 5).map(t => (
+                                        {[...transactions].sort((a, b) => new Date(b.transaction_date).getTime() - new Date(a.transaction_date).getTime()).slice(0, 5).map(t => (
                                             <tr key={t.id}>
                                                 <td><span style={{ padding: '4px 10px', borderRadius: '999px', fontSize: '0.8rem', background: t.type === 'Deposit' ? '#e6f4ea' : '#fce8e8', color: t.type === 'Deposit' ? '#2d7a47' : '#c53030' }}>{t.type}</span></td>
                                                 <td>{t.amount.toLocaleString()}</td>
-                                                <td>{t.date}</td>
+                                                <td>{t.transaction_date}</td>
                                                 <td>{t.note || '—'}</td>
                                             </tr>
                                         ))}
@@ -166,14 +303,14 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                                 <form onSubmit={handleLoanSubmit}>
                                     <h4 style={{ marginBottom: '16px', color: '#1a1f36' }}>Personal Information</h4>
                                     <div className="form-grid">
-                                        <div><label className="label-field">Full Name</label><input className="input-field" value={loanForm.name} readOnly disabled /></div>
-                                        <div><label className="label-field">Phone Number</label><input type="tel" className="input-field" value="+256 700 000 000" readOnly disabled /></div>
+                                        <div><label className="label-field">Full Name</label><input className="input-field" value={userProfile?.full_name || ''} readOnly disabled /></div>
+                                        <div><label className="label-field">Phone Number</label><input type="tel" className="input-field" value={userProfile?.phone || ''} readOnly disabled /></div>
                                     </div>
 
                                     <hr style={{ border: 'none', borderTop: '1px solid #e3e8ee', margin: '32px 0' }} />
                                     <h4 style={{ marginBottom: '16px', color: '#1a1f36' }}>Loan Details</h4>
                                     <div className="form-grid">
-                                        <div><label className="label-field">Desired Loan Amount (UGX) *</label><input type="number" className="input-field" placeholder="0" required value={loanForm.amount} onChange={e => setLoanForm({ ...loanForm, amount: e.target.value })} /></div>
+                                        <div><label className="label-field">Desired Loan Amount (UGX) *</label><input type="number" className="input-field" placeholder={`Max allowed: UGX ${(savingsBalance * 0.6).toLocaleString()}`} required value={loanForm.amount} onChange={e => setLoanForm({ ...loanForm, amount: e.target.value })} disabled={loanLoading} /></div>
                                         <div><label className="label-field">Repayment Deadline *</label>
                                             <input
                                                 type="date"
@@ -182,15 +319,39 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                                                 min={new Date().toISOString().split('T')[0]}
                                                 value={loanForm.repaymentDate}
                                                 onChange={e => setLoanForm({ ...loanForm, repaymentDate: e.target.value })}
+                                                disabled={loanLoading}
                                             />
                                         </div>
-                                        <div style={{ gridColumn: '1 / -1' }}><label className="label-field">Loan Purpose *</label><textarea className="input-field" rows={3} placeholder="E.g. Business expansion, school fees..." required value={loanForm.purpose} onChange={e => setLoanForm({ ...loanForm, purpose: e.target.value })} /></div>
+                                        <div style={{ gridColumn: '1 / -1' }}><label className="label-field">Loan Purpose *</label><textarea className="input-field" rows={3} placeholder="E.g. Business expansion, school fees..." required value={loanForm.purpose} onChange={e => setLoanForm({ ...loanForm, purpose: e.target.value })} disabled={loanLoading} /></div>
                                     </div>
 
-                                    <button type="submit" className="btn-dark" style={{ marginTop: '32px', width: '100%', justifyContent: 'center' }}>Submit Application</button>
+                                    <button type="submit" className="btn-dark" style={{ marginTop: '32px', width: '100%', justifyContent: 'center' }} disabled={loanLoading}>{loanLoading ? 'Submitting...' : 'Submit Application'}</button>
                                 </form>
                             </>
                         )}
+
+                        <div className="dash-section-header" style={{ marginTop: '40px' }}>
+                            <h2>My Loan Applications</h2>
+                        </div>
+                        <div className="dash-table-wrapper">
+                            {loans.length === 0 ? (
+                                <div className="dash-empty-state"><CreditCard size={48} strokeWidth={1.5} /><p>No loan applications found.</p></div>
+                            ) : (
+                                <table className="dash-table">
+                                    <thead><tr><th>Amount (UGX)</th><th>Applied On</th><th>Due Date</th><th>Status</th></tr></thead>
+                                    <tbody>
+                                        {[...loans].sort((a, b) => new Date(b.applied_on).getTime() - new Date(a.applied_on).getTime()).map(l => (
+                                            <tr key={l.id}>
+                                                <td>{l.amount.toLocaleString()}</td>
+                                                <td>{l.applied_on}</td>
+                                                <td>{l.repayment_date}</td>
+                                                <td><span style={{ padding: '4px 10px', borderRadius: '999px', fontSize: '0.8rem', background: l.status === 'Approved' ? '#e6f4ea' : l.status === 'Rejected' ? '#fce8e8' : '#fef9e7', color: l.status === 'Approved' ? '#2d7a47' : l.status === 'Rejected' ? '#c53030' : '#92610a' }}>{l.status}</span></td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            )}
+                        </div>
                     </div>
                 );
             case 'transactions':
@@ -218,7 +379,7 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                                             <tr key={t.id}>
                                                 <td><span style={{ padding: '4px 10px', borderRadius: '999px', fontSize: '0.8rem', background: t.type === 'Deposit' ? '#e6f4ea' : '#fce8e8', color: t.type === 'Deposit' ? '#2d7a47' : '#c53030' }}>{t.type}</span></td>
                                                 <td>{t.amount.toLocaleString()}</td>
-                                                <td>{t.date}</td>
+                                                <td>{t.transaction_date}</td>
                                                 <td>{t.note || '—'}</td>
                                             </tr>
                                         ))}
@@ -252,7 +413,7 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                     </div>
                 </div>
                 <div style={{ padding: '16px', borderTop: '1px solid #e3e8ee' }}>
-                    <button className="nav-item nav-logout" style={{ width: '100%', cursor: 'pointer', background: 'none', border: 'none' }} onClick={onLogout}>
+                    <button className="nav-item nav-logout" style={{ width: '100%', cursor: 'pointer', background: 'none', border: 'none' }} onClick={handleLogoutClick}>
                         <LogOut size={20} /> Logout
                     </button>
                 </div>
@@ -271,8 +432,10 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                             className="btn-icon"
                             title="Reminders"
                             onClick={(e) => { e.stopPropagation(); setShowReminders(!showReminders); }}
+                            style={{ position: 'relative' }}
                         >
                             <Bell size={18} />
+                            {reminders.length > 0 && <span style={{ position: 'absolute', top: -2, right: -2, background: 'red', color: 'white', fontSize: '10px', borderRadius: '50%', padding: '2px 5px' }}>{reminders.length}</span>}
                         </button>
 
                         {showReminders && (
@@ -286,7 +449,7 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                                         <div key={r.id} className="reminder-item">
                                             <div className="reminder-title">{r.title}</div>
                                             <div className="reminder-msg">{r.message}</div>
-                                            <div className="reminder-date">{r.date}</div>
+                                            <div className="reminder-date">{new Date(r.created_at).toLocaleDateString()}</div>
                                         </div>
                                     ))}
                                     {reminders.length === 0 && <div style={{ padding: '20px', textAlign: 'center', color: '#a0aec0' }}>No new reminders.</div>}
@@ -296,6 +459,7 @@ export default function MemberDashboard({ onLogout }: MemberDashboardProps) {
                     </div>
                 </div>
                 <div className="dash-content">
+                    <div style={{ marginBottom: '24px', fontSize: '1.2rem', color: '#4a5568' }}>Welcome back, <strong>{userProfile?.full_name}</strong></div>
                     {renderContent()}
                 </div>
             </div>
